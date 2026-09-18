@@ -18,34 +18,34 @@ on:
         default: ""
   push:
     paths-ignore:
-      - "docs/**"
-      - "conda/**"
-      - "scripts/**"
-      - "examples/**"
-      - "**.md"
-      - "**.yaml"
-      - "**.yml"
-      - "**.ipynb"
+    - "docs/**"
+    - "conda/**"
+    - "scripts/**"
+    - "examples/**"
+    - "**.md"
+    - "**.yaml"
+    - "**.yml"
+    - "**.ipynb"
     branches:
-      - "master"
-      - "*release*"
-      - "release/**"
-      - "main"
+    - "master"
+    - "*release*"
+    - "release/**"
+    - "main"
   pull_request:
     paths-ignore:
-      - "docs/**"
-      - "conda/**"
-      - "scripts/**"
-      - "examples/**"
-      - "**.md"
-      - "**.yaml"
-      - "**.yml"
-      - "**.ipynb"
+    - "docs/**"
+    - "conda/**"
+    - "scripts/**"
+    - "examples/**"
+    - "**.md"
+    - "**.yaml"
+    - "**.yml"
+    - "**.ipynb"
     branches:
-      - "master"
-      - "*release*"
-      - "release/**"
-      - "main"
+    - "master"
+    - "*release*"
+    - "release/**"
+    - "main"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}-${{ inputs.leg || 'push' }}-${{ inputs.racecar_run }}
@@ -72,53 +72,124 @@ jobs:
     name: Build and Test on Apache Spark 3.4.x
 
     steps:
-      - name: Checkout code
-        uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          observables_continue_on_error: false
-          lfs: false
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+    - name: Checkout code
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        observables_continue_on_error: false
+        lfs: false
+    - name: Setup openjdk Java
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y openjdk-8-jdk
+        echo "JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64" >> $GITHUB_ENV
+        echo "/usr/lib/jvm/java-8-openjdk-amd64/bin" >> $GITHUB_PATH
+        java -version
+    - name: Install Python 3.8
+      uses: actions/setup-python@v2
+      with:
+        python-version: 3.8
+        architecture: x64
+    - name: Install Python packages (Python 3.8)
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyspark==3.4.0 numpy pytest
+    - uses: sbt/setup-sbt@v1
+      with:
+        disk-cache: false
+    - name: Build Spark NLP on Apache Spark 3.4.0
+      run: |
+        sbt -mem 4096 -Dis_spark34=true clean assemblyAndCopy
+    - name: Test Spark NLP in Scala - Apache Spark 3.4.x
+      run: |
+        sbt -mem 4096 coverage test
+    - name: Upload coverage data to Coveralls
+      run: sbt coverageReport coveralls
+      env:
+        COVERALLS_REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        COVERALLS_FLAG_NAME: Apache Spark 3.4.x - Scala 2.12
+    - name: Test Spark NLP in Python - Apache Spark 3.4.x
+      run: |
+        cd python
+        python3.8 -m pytest -v -m fast
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
 
-      - name: Setup openjdk Java
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y openjdk-8-jdk
-          echo "JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64" >> $GITHUB_ENV
-          echo "/usr/lib/jvm/java-8-openjdk-amd64/bin" >> $GITHUB_PATH
-          java -version
-      - name: Install Python 3.8
-        uses: actions/setup-python@v2
-        with:
-          python-version: 3.8
-          architecture: x64
-      - name: Install Python packages (Python 3.8)
-        run: |
-          python -m pip install --upgrade pip
-          pip install pyspark==3.4.0 numpy pytest
-      - uses: sbt/setup-sbt@v1
-        with:
-          disk-cache: false
-      - name: Build Spark NLP on Apache Spark 3.4.0
-        run: |
-          sbt -mem 4096 -Dis_spark34=true clean assemblyAndCopy
-      - name: Test Spark NLP in Scala - Apache Spark 3.4.x
-        run: |
-          sbt -mem 4096 coverage test
-      - name: Upload coverage data to Coveralls
-        run: sbt coverageReport coveralls
-        env:
-          COVERALLS_REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          COVERALLS_FLAG_NAME: Apache Spark 3.4.x - Scala 2.12
-      - name: Test Spark NLP in Python - Apache Spark 3.4.x
-        run: |
-          cd python
-          python3.8 -m pytest -v -m fast
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   spark35:
     if: "! contains(toJSON(github.event.commits.*.message), '[skip test]')"
     runs-on: ubuntu-22.04
@@ -128,49 +199,120 @@ jobs:
     name: Build and Test on Apache Spark 3.5.x
 
     steps:
-      - name: Checkout code
-        uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          observables_continue_on_error: false
-          lfs: false
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+    - name: Checkout code
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        observables_continue_on_error: false
+        lfs: false
+    - name: Setup openjdk Java
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y openjdk-8-jdk
+        echo "JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64" >> $GITHUB_ENV
+        echo "/usr/lib/jvm/java-8-openjdk-amd64/bin" >> $GITHUB_PATH
+        java -version
+    - name: Install Python 3.10
+      uses: actions/setup-python@v2
+      with:
+        python-version: 3.10.12
+        architecture: x64
+    - name: Install Python packages (Python 3.10)
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyspark==3.5.0 numpy pytest
+    - uses: sbt/setup-sbt@v1
+      with:
+        disk-cache: false
+    - name: Build Spark NLP on Apache Spark 3.5.0
+      run: |
+        sbt -mem 4096 -Dis_spark35=true clean assemblyAndCopy
+    - name: Test Spark NLP in Scala - Apache Spark 3.5.x
+      run: |
+        sbt -mem 4096 test
+    - name: Test Spark NLP in Python - Apache Spark 3.5.x
+      run: |
+        cd python
+        python3.10 -m pytest -v -m fast
 
-      - name: Setup openjdk Java
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y openjdk-8-jdk
-          echo "JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64" >> $GITHUB_ENV
-          echo "/usr/lib/jvm/java-8-openjdk-amd64/bin" >> $GITHUB_PATH
-          java -version
-      - name: Install Python 3.10
-        uses: actions/setup-python@v2
-        with:
-          python-version: 3.10.12
-          architecture: x64
-      - name: Install Python packages (Python 3.10)
-        run: |
-          python -m pip install --upgrade pip
-          pip install pyspark==3.5.0 numpy pytest
-      - uses: sbt/setup-sbt@v1
-        with:
-          disk-cache: false
-      - name: Build Spark NLP on Apache Spark 3.5.0
-        run: |
-          sbt -mem 4096 -Dis_spark35=true clean assemblyAndCopy
-      - name: Test Spark NLP in Scala - Apache Spark 3.5.x
-        run: |
-          sbt -mem 4096 test
-      - name: Test Spark NLP in Python - Apache Spark 3.5.x
-        run: |
-          cd python
-          python3.10 -m pytest -v -m fast
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
 
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   spark33:
     if: "! contains(toJSON(github.event.commits.*.message), '[skip test]')"
     runs-on: ubuntu-22.04
@@ -180,45 +322,116 @@ jobs:
     name: Build and Test on Apache Spark 3.3.x
 
     steps:
-      - name: Checkout code
-        uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          observables_continue_on_error: false
-          lfs: false
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+    - name: Checkout code
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        observables_continue_on_error: false
+        lfs: false
+    - name: Setup openjdk Java
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y openjdk-8-jdk
+        echo "JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64" >> $GITHUB_ENV
+        echo "/usr/lib/jvm/java-8-openjdk-amd64/bin" >> $GITHUB_PATH
+        java -version
+    - name: Install Python 3.8
+      uses: actions/setup-python@v2
+      with:
+        python-version: 3.8
+        architecture: x64
+    - name: Install Python packages (Python 3.8)
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyspark==3.3.1 numpy pytest
+    - uses: sbt/setup-sbt@v1
+      with:
+        disk-cache: false
+    - name: Build Spark NLP on Apache Spark 3.3.1
+      run: |
+        sbt -mem 4096 -Dis_spark33=true clean assemblyAndCopy
+    - name: Test Spark NLP in Scala - Apache Spark 3.3.x
+      run: |
+        sbt -mem 4096 test
+    - name: Test Spark NLP in Python - Apache Spark 3.3.x
+      run: |
+        cd python
+        python3.8 -m pytest -v -m fast
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
 
-      - name: Setup openjdk Java
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y openjdk-8-jdk
-          echo "JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64" >> $GITHUB_ENV
-          echo "/usr/lib/jvm/java-8-openjdk-amd64/bin" >> $GITHUB_PATH
-          java -version
-      - name: Install Python 3.8
-        uses: actions/setup-python@v2
-        with:
-          python-version: 3.8
-          architecture: x64
-      - name: Install Python packages (Python 3.8)
-        run: |
-          python -m pip install --upgrade pip
-          pip install pyspark==3.3.1 numpy pytest
-      - uses: sbt/setup-sbt@v1
-        with:
-          disk-cache: false
-      - name: Build Spark NLP on Apache Spark 3.3.1
-        run: |
-          sbt -mem 4096 -Dis_spark33=true clean assemblyAndCopy
-      - name: Test Spark NLP in Scala - Apache Spark 3.3.x
-        run: |
-          sbt -mem 4096 test
-      - name: Test Spark NLP in Python - Apache Spark 3.3.x
-        run: |
-          cd python
-          python3.8 -m pytest -v -m fast
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
